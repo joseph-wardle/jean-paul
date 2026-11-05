@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from datetime import datetime
 
 import discord
@@ -33,6 +34,8 @@ FORWARDED_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 REPLY_SEARCH_LIMIT = 50
 
 POLL_SECONDS = 60
+# The sweep re-reads both platforms: a retry net for anything a live event missed.
+SWEEP_SECONDS = 15 * 60
 THREAD_NAME_LIMIT = 100
 
 
@@ -55,7 +58,8 @@ class JeanPaul(discord.Client):
         # One write at a time: two events for one report can't both create its other
         # half, and replies reach GitHub in Discord order.
         self._write_lock = asyncio.Lock()
-        self._poller: asyncio.Task[None] | None = None
+        self._sync: asyncio.Task[None] | None = None
+        self._sweep_due = True
 
     async def setup_hook(self) -> None:
         # PyGithub is synchronous; keep it off the event loop.
@@ -67,23 +71,22 @@ class JeanPaul(discord.Client):
             self.config.github_repo,
         )
         self.setup_problems += await asyncio.to_thread(github.check_repo, self.repo)
-        self.thread_issues = await asyncio.to_thread(github.thread_index, self.repo, self.bot_login)
 
     async def on_ready(self) -> None:
-        # on_ready fires again after a fresh session; the setup only needs doing once.
-        if self._poller is not None:
+        # on_ready fires again after a fresh session, which means events were missed.
+        if self._sync is not None:
+            self._sweep_due = True
             return
         forum, problems = self._check_discord()
         self.setup_problems += problems
         if forum is None or self.setup_problems:
             await self.close()
             return
-        self.thread_issues |= await self._index_bot_posts(forum)
-        self.newest_forwarded = await asyncio.to_thread(
-            github.newest_forwarded, self.repo, self.bot_login, self.thread_issues
-        )
+        # The indexes must exist before live events are handled, or a reply would
+        # forward its whole thread again.
+        await self._rebuild_indexes(await _forum_posts(forum))
         self.forum = forum
-        self._poller = asyncio.create_task(self._poll_github())
+        self._sync = asyncio.create_task(self._keep_in_sync())
         log.info("Connected as %s; filing reports on %s.", self.user, self.repo.full_name)
 
     async def on_message(self, message: discord.Message) -> None:
@@ -134,6 +137,7 @@ class JeanPaul(discord.Client):
             if not await self._has_replied(thread, issue_url):
                 await thread.send(f"Recorded as [#{number}](<{issue_url}>).")
             await thread.add_tags(open_tag)
+            log.info("Tagged post %s Open for issue #%d.", thread.id, number)
 
     async def forward_replies(self, thread: discord.Thread) -> None:
         """Comment every reply newer than the last one forwarded, oldest first.
@@ -178,19 +182,69 @@ class JeanPaul(discord.Client):
                 await asyncio.to_thread(github.add_thread_marker, issue, thread.id)
             await self._sync_status(thread, issue)
 
-    async def _poll_github(self) -> None:
+    async def _keep_in_sync(self) -> None:
+        """Poll GitHub every minute, and sweep both platforms at start-up, after a fresh
+        session and every SWEEP_SECONDS."""
         since: datetime | None = None
+        next_sweep = 0.0
         while not self.is_closed():
             try:
-                issues = await asyncio.to_thread(github.labelled_issues, self.repo, since)
-                for issue in issues:
-                    await self.reconcile_issue(issue)
-                # Only advance once every issue went through, so a failure is retried.
-                if issues:
-                    since = max(issue.updated_at for issue in issues)
+                if self._sweep_due or time.monotonic() >= next_sweep:
+                    await self._sweep_posts()
+                    # The GitHub half of the sweep: every labelled issue, not just changes.
+                    since = None
+                    self._sweep_due = False
+                    next_sweep = time.monotonic() + SWEEP_SECONDS
+                since = await self._poll_issues(since)
             except Exception:
-                log.exception("Polling GitHub failed; retrying in %d s.", POLL_SECONDS)
+                log.exception("Syncing failed; retrying in %d s.", POLL_SECONDS)
             await asyncio.sleep(POLL_SECONDS)
+
+    async def _sweep_posts(self) -> None:
+        """Record every untagged post and forward every reply not yet on GitHub."""
+        assert self.forum is not None
+        posts = await _forum_posts(self.forum)
+        await self._rebuild_indexes(posts)
+        for thread in posts:
+            try:
+                await self.record_post(thread)
+                if self._has_unforwarded(thread):
+                    await self.forward_replies(thread)
+            except Exception:
+                log.exception("Could not reconcile post %s (%r).", thread.id, thread.name)
+
+    async def _poll_issues(self, since: datetime | None) -> datetime | None:
+        """Reconcile each labelled issue updated since `since`; return where to resume."""
+        issues = await asyncio.to_thread(github.labelled_issues, self.repo, since)
+        failed = False
+        for issue in issues:
+            try:
+                await self.reconcile_issue(issue)
+            except Exception:
+                failed = True
+                log.exception("Could not reconcile issue #%d.", issue.number)
+        # Only advance once every issue went through, so a failure is retried.
+        if failed or not issues:
+            return since
+        return max(issue.updated_at for issue in issues)
+
+    async def _rebuild_indexes(self, posts: list[discord.Thread]) -> None:
+        """Re-read both indexes from GitHub and the forum.
+
+        Merged into what this run already knows, so a write GitHub hasn't listed yet
+        is never forgotten and a reply is never forwarded twice.
+        """
+        self.thread_issues |= await asyncio.to_thread(
+            github.thread_index, self.repo, self.bot_login
+        )
+        self.thread_issues |= await self._index_bot_posts(posts)
+        forwarded = await asyncio.to_thread(
+            github.newest_forwarded, self.repo, self.bot_login, self.thread_issues
+        )
+        for thread_id, message_id in forwarded.items():
+            self.newest_forwarded[thread_id] = max(
+                message_id, self.newest_forwarded.get(thread_id, 0)
+            )
 
     async def _create_post(self, issue: Issue) -> discord.Thread:
         assert self.forum is not None
@@ -216,6 +270,7 @@ class JeanPaul(discord.Client):
         if wanted in tags:
             if is_open and thread.archived:
                 await thread.edit(archived=False)
+                log.info("Un-archived open post %s for issue #%d.", thread.id, issue.number)
             return
 
         if thread.archived:
@@ -225,23 +280,26 @@ class JeanPaul(discord.Client):
         await thread.edit(applied_tags=[*others, wanted], archived=not is_open)
         log.info("Marked post %s %s for issue #%d.", thread.id, wanted.name, issue.number)
 
-    async def _index_bot_posts(self, forum: discord.ForumChannel) -> dict[int, int]:
+    async def _index_bot_posts(self, posts: list[discord.Thread]) -> dict[int, int]:
         """Map each post the bot created from an issue to that issue.
 
         Lets a restart find a post whose issue never got its marker.
         """
         assert self.user is not None
-        threads = list(forum.threads)
-        threads += [thread async for thread in forum.archived_threads(limit=None)]
         index = {}
-        for thread in threads:
-            if thread.owner_id != self.user.id:
+        for thread in posts:
+            if thread.owner_id != self.user.id or thread.id in self.thread_issues:
                 continue
             starter = await thread.fetch_message(thread.id)
             number = report.issue_number_in_post(starter.content, self.repo.html_url)
             if number is not None:
                 index[thread.id] = number
         return index
+
+    def _has_unforwarded(self, thread: discord.Thread) -> bool:
+        # Saves a history request per post per sweep; unknown means look.
+        newest = self.newest_forwarded.get(thread.id, thread.id)
+        return thread.last_message_id is None or thread.last_message_id > newest
 
     async def _has_replied(self, thread: discord.Thread, issue_url: str) -> bool:
         async for message in thread.history(limit=REPLY_SEARCH_LIMIT):
@@ -280,6 +338,12 @@ def run(config: Config) -> None:
     client.run(config.discord_token, log_handler=None)
     if client.setup_problems:
         raise SetupError("\n".join(client.setup_problems))
+
+
+async def _forum_posts(forum: discord.ForumChannel) -> list[discord.Thread]:
+    """Every post in the forum, active and archived."""
+    archived = [thread async for thread in forum.archived_threads(limit=None)]
+    return [*forum.threads, *archived]
 
 
 def _tag(forum: discord.ForumChannel, name: str) -> discord.ForumTag:
