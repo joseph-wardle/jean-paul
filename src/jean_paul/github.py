@@ -1,7 +1,10 @@
 """GitHub access as the Jean Paul GitHub App. Every call here blocks."""
 
+from datetime import datetime
+
 from github import Auth, GithubIntegration
 from github.GithubException import GithubException
+from github.GithubObject import NotSet
 from github.Issue import Issue
 from github.Repository import Repository
 
@@ -66,6 +69,22 @@ def newest_forwarded(
         # Discord ids grow with time, so the largest is the newest.
         newest[thread_id] = max(message_id, newest.get(thread_id, 0))
     return newest
+
+
+def labelled_issues(repo: Repository, since: datetime | None) -> list[Issue]:
+    """Every labelled issue, open or closed, updated at or after `since`, oldest first."""
+    issues = repo.get_issues(
+        state="all",
+        labels=[REPORT_LABEL],
+        sort="updated",
+        direction="asc",
+        since=since if since is not None else NotSet,
+    )
+    return [issue for issue in issues if issue.pull_request is None]
+
+
+def add_thread_marker(issue: Issue, thread_id: int) -> None:
+    issue.edit(body=f"{issue.body or ''}\n\n{report.THREAD_MARKER.format(thread_id)}".lstrip())
 
 
 def create_report_issue(repo: Repository, title: str, body: str) -> Issue:

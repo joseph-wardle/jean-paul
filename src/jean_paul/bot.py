@@ -1,9 +1,11 @@
-"""The Discord side: checks the forum setup, then copies forum posts and replies to GitHub."""
+"""The Discord side: checks the forum setup, then keeps forum posts and issues in step."""
 
 import asyncio
 import logging
+from datetime import datetime
 
 import discord
+from github.Issue import Issue
 from github.Repository import Repository
 
 from jean_paul import github, report
@@ -30,6 +32,9 @@ FORWARDED_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 # How far back to look for an earlier "Recorded as" reply after an interrupted run.
 REPLY_SEARCH_LIMIT = 50
 
+POLL_SECONDS = 60
+THREAD_NAME_LIMIT = 100
+
 
 class SetupError(Exception):
     pass
@@ -47,9 +52,10 @@ class JeanPaul(discord.Client):
         self.forum: discord.ForumChannel | None = None
         self.thread_issues: dict[int, int] = {}
         self.newest_forwarded: dict[int, int] = {}
-        # One write at a time: two events for one post can't both create an issue,
-        # and replies reach GitHub in Discord order.
+        # One write at a time: two events for one report can't both create its other
+        # half, and replies reach GitHub in Discord order.
         self._write_lock = asyncio.Lock()
+        self._poller: asyncio.Task[None] | None = None
 
     async def setup_hook(self) -> None:
         # PyGithub is synchronous; keep it off the event loop.
@@ -62,20 +68,22 @@ class JeanPaul(discord.Client):
         )
         self.setup_problems += await asyncio.to_thread(github.check_repo, self.repo)
         self.thread_issues = await asyncio.to_thread(github.thread_index, self.repo, self.bot_login)
-        self.newest_forwarded = await asyncio.to_thread(
-            github.newest_forwarded, self.repo, self.bot_login, self.thread_issues
-        )
 
     async def on_ready(self) -> None:
-        # on_ready fires again after a fresh session; the setup only needs checking once.
-        if self.forum is not None:
+        # on_ready fires again after a fresh session; the setup only needs doing once.
+        if self._poller is not None:
             return
         forum, problems = self._check_discord()
         self.setup_problems += problems
-        if self.setup_problems:
+        if forum is None or self.setup_problems:
             await self.close()
             return
+        self.thread_issues |= await self._index_bot_posts(forum)
+        self.newest_forwarded = await asyncio.to_thread(
+            github.newest_forwarded, self.repo, self.bot_login, self.thread_issues
+        )
         self.forum = forum
+        self._poller = asyncio.create_task(self._poll_github())
         log.info("Connected as %s; filing reports on %s.", self.user, self.repo.full_name)
 
     async def on_message(self, message: discord.Message) -> None:
@@ -103,9 +111,7 @@ class JeanPaul(discord.Client):
 
         Each step checks for the one before it, so an interrupted run can be repeated.
         """
-        assert self.forum is not None
-        open_tag = _tag(self.forum, OPEN_TAG)
-        closed_tag = _tag(self.forum, CLOSED_TAG)
+        open_tag, closed_tag = self._status_tags()
         async with self._write_lock:
             if open_tag in thread.applied_tags or closed_tag in thread.applied_tags:
                 return
@@ -150,11 +156,102 @@ class JeanPaul(discord.Client):
                     log.info("Forwarded message %s to issue #%d.", message.id, number)
                 self.newest_forwarded[thread.id] = message.id
 
+    async def reconcile_issue(self, issue: Issue) -> None:
+        """Give a labelled issue its post and its thread marker, and match the post's tag
+        to the issue's state."""
+        async with self._write_lock:
+            thread_id = next(
+                (thread for thread, number in self.thread_issues.items() if number == issue.number),
+                None,
+            )
+            if thread_id is None:
+                thread = await self._create_post(issue)
+            else:
+                try:
+                    thread = await self.fetch_channel(thread_id)
+                except discord.NotFound:
+                    log.warning("Issue #%d's post %s was deleted.", issue.number, thread_id)
+                    return
+                assert isinstance(thread, discord.Thread)
+
+            if report.thread_id_in(issue.body) != thread.id:
+                await asyncio.to_thread(github.add_thread_marker, issue, thread.id)
+            await self._sync_status(thread, issue)
+
+    async def _poll_github(self) -> None:
+        since: datetime | None = None
+        while not self.is_closed():
+            try:
+                issues = await asyncio.to_thread(github.labelled_issues, self.repo, since)
+                for issue in issues:
+                    await self.reconcile_issue(issue)
+                # Only advance once every issue went through, so a failure is retried.
+                if issues:
+                    since = max(issue.updated_at for issue in issues)
+            except Exception:
+                log.exception("Polling GitHub failed; retrying in %d s.", POLL_SECONDS)
+            await asyncio.sleep(POLL_SECONDS)
+
+    async def _create_post(self, issue: Issue) -> discord.Thread:
+        assert self.forum is not None
+        open_tag, _ = self._status_tags()
+        created = await self.forum.create_thread(
+            name=issue.title[:THREAD_NAME_LIMIT],
+            content=report.post_content(issue.body, issue.html_url, issue.number),
+            applied_tags=[open_tag],
+        )
+        self.thread_issues[created.thread.id] = issue.number
+        log.info("Posted issue #%d as post %s.", issue.number, created.thread.id)
+        return created.thread
+
+    async def _sync_status(self, thread: discord.Thread, issue: Issue) -> None:
+        open_tag, closed_tag = self._status_tags()
+        tags = thread.applied_tags
+        if open_tag not in tags and closed_tag not in tags:
+            # A forum post whose recording was interrupted; record_post finishes it.
+            return
+
+        is_open = issue.state == "open"
+        wanted = open_tag if is_open else closed_tag
+        if wanted in tags:
+            if is_open and thread.archived:
+                await thread.edit(archived=False)
+            return
+
+        if thread.archived:
+            thread = await thread.edit(archived=False)
+        await thread.send(report.status_line(issue.state, issue.state_reason))
+        others = [tag for tag in tags if tag not in (open_tag, closed_tag)]
+        await thread.edit(applied_tags=[*others, wanted], archived=not is_open)
+        log.info("Marked post %s %s for issue #%d.", thread.id, wanted.name, issue.number)
+
+    async def _index_bot_posts(self, forum: discord.ForumChannel) -> dict[int, int]:
+        """Map each post the bot created from an issue to that issue.
+
+        Lets a restart find a post whose issue never got its marker.
+        """
+        assert self.user is not None
+        threads = list(forum.threads)
+        threads += [thread async for thread in forum.archived_threads(limit=None)]
+        index = {}
+        for thread in threads:
+            if thread.owner_id != self.user.id:
+                continue
+            starter = await thread.fetch_message(thread.id)
+            number = report.issue_number_in_post(starter.content, self.repo.html_url)
+            if number is not None:
+                index[thread.id] = number
+        return index
+
     async def _has_replied(self, thread: discord.Thread, issue_url: str) -> bool:
         async for message in thread.history(limit=REPLY_SEARCH_LIMIT):
             if message.author == self.user and issue_url in message.content:
                 return True
         return False
+
+    def _status_tags(self) -> tuple[discord.ForumTag, discord.ForumTag]:
+        assert self.forum is not None
+        return _tag(self.forum, OPEN_TAG), _tag(self.forum, CLOSED_TAG)
 
     def _check_discord(self) -> tuple[discord.ForumChannel | None, list[str]]:
         guild = self.get_guild(self.config.guild_id)
