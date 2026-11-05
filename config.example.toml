@@ -1,0 +1,16 @@
+# Copy to ~/.config/jean-paul/config.toml. The two secrets sit beside it:
+#   ~/.config/jean-paul/discord_token   (bot token, Discord developer portal → Bot)
+#   ~/.config/jean-paul/github_app.pem  (private key, GitHub App settings)
+# Keep all three files mode 600.
+
+[discord]
+# Developer Mode on, then right-click → Copy ID.
+guild_id = 0
+forum_id = 0
+maintainer_channel_id = 0
+
+[github]
+# GitHub App settings → General → App ID.
+app_id = 0
+# The repository the App is installed on, where reports become issues.
+repo = "owner/name"
