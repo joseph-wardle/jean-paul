@@ -1,0 +1,30 @@
+# Fails, and so emails the maintainer, if any forum post went unrecorded.
+# Lives here until the cutover; then it moves to sandwich-pipeline, whose activity
+# keeps the schedule from being disabled after 60 quiet days.
+name: Watchdog
+
+on:
+  schedule:
+    - cron: "0 13 * * *" # 06:00 Mountain Standard Time
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+
+      - name: Check every post is recorded
+        run: uv run jean-paul-watchdog
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          DISCORD_FORUM_ID: "1567756342448361523" # sandbox forum

@@ -9,7 +9,7 @@ import discord
 from github.Issue import Issue
 from github.Repository import Repository
 
-from jean_paul import github, report
+from jean_paul import alerts, github, report
 from jean_paul.config import Config
 
 log = logging.getLogger(__name__)
@@ -84,7 +84,17 @@ class JeanPaul(discord.Client):
             return
         # The indexes must exist before live events are handled, or a reply would
         # forward its whole thread again.
-        await self._rebuild_indexes(await _forum_posts(forum))
+        try:
+            await self._rebuild_indexes(await _forum_posts(forum))
+        except Exception:
+            # Exit, and let systemd retry, rather than run without the indexes.
+            log.exception("Could not read the existing reports.")
+            self.setup_problems.append("Could not read the existing reports; see the error above.")
+            await self.close()
+            return
+        maintainer = self.get_channel(self.config.maintainer_channel_id)
+        assert isinstance(maintainer, discord.TextChannel)
+        log.addHandler(alerts.ChannelAlerts(maintainer))
         self.forum = forum
         self._sync = asyncio.create_task(self._keep_in_sync())
         log.info("Connected as %s; filing reports on %s.", self.user, self.repo.full_name)
@@ -174,7 +184,13 @@ class JeanPaul(discord.Client):
                 try:
                     thread = await self.fetch_channel(thread_id)
                 except discord.NotFound:
-                    log.warning("Issue #%d's post %s was deleted.", issue.number, thread_id)
+                    log.warning(
+                        "Issue #%d's post %s was deleted. Remove the '%s' label to stop "
+                        "mirroring the issue.",
+                        issue.number,
+                        thread_id,
+                        github.REPORT_LABEL,
+                    )
                     return
                 assert isinstance(thread, discord.Thread)
 
