@@ -47,5 +47,34 @@ def thread_index(repo: Repository, bot_login: str) -> dict[int, int]:
     return index
 
 
+def newest_forwarded(
+    repo: Repository, bot_login: str, thread_issues: dict[int, int]
+) -> dict[int, int]:
+    """Map forum thread id to the newest Discord message the bot forwarded from it.
+
+    One repo-wide listing of comments; only the bot's own comments are trusted.
+    """
+    thread_of_issue = {number: thread_id for thread_id, number in thread_issues.items()}
+    newest: dict[int, int] = {}
+    for comment in repo.get_issues_comments():
+        if comment.user.login != bot_login:
+            continue
+        message_id = report.message_id_in(comment.body)
+        thread_id = thread_of_issue.get(_issue_number(comment.issue_url))
+        if message_id is None or thread_id is None:
+            continue
+        # Discord ids grow with time, so the largest is the newest.
+        newest[thread_id] = max(message_id, newest.get(thread_id, 0))
+    return newest
+
+
 def create_report_issue(repo: Repository, title: str, body: str) -> Issue:
     return repo.create_issue(title=title, body=body, labels=[REPORT_LABEL])
+
+
+def add_comment(repo: Repository, number: int, body: str) -> None:
+    repo.get_issue(number).create_comment(body)
+
+
+def _issue_number(issue_url: str) -> int:
+    return int(issue_url.rsplit("/", 1)[1])

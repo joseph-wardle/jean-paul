@@ -1,4 +1,4 @@
-"""The Discord side: checks the forum setup, then records each new post as an issue."""
+"""The Discord side: checks the forum setup, then copies forum posts and replies to GitHub."""
 
 import asyncio
 import logging
@@ -24,6 +24,9 @@ FORUM_PERMISSIONS = (
 )
 MAINTAINER_PERMISSIONS = ("view_channel", "send_messages")
 
+# System messages (pins, renames) are not part of the conversation.
+FORWARDED_TYPES = (discord.MessageType.default, discord.MessageType.reply)
+
 # How far back to look for an earlier "Recorded as" reply after an interrupted run.
 REPLY_SEARCH_LIMIT = 50
 
@@ -43,8 +46,10 @@ class JeanPaul(discord.Client):
         self.setup_problems: list[str] = []
         self.forum: discord.ForumChannel | None = None
         self.thread_issues: dict[int, int] = {}
-        # One post at a time, so two events for one post can't both create an issue.
-        self._record_lock = asyncio.Lock()
+        self.newest_forwarded: dict[int, int] = {}
+        # One write at a time: two events for one post can't both create an issue,
+        # and replies reach GitHub in Discord order.
+        self._write_lock = asyncio.Lock()
 
     async def setup_hook(self) -> None:
         # PyGithub is synchronous; keep it off the event loop.
@@ -57,6 +62,9 @@ class JeanPaul(discord.Client):
         )
         self.setup_problems += await asyncio.to_thread(github.check_repo, self.repo)
         self.thread_issues = await asyncio.to_thread(github.thread_index, self.repo, self.bot_login)
+        self.newest_forwarded = await asyncio.to_thread(
+            github.newest_forwarded, self.repo, self.bot_login, self.thread_issues
+        )
 
     async def on_ready(self) -> None:
         # on_ready fires again after a fresh session; the setup only needs checking once.
@@ -71,19 +79,22 @@ class JeanPaul(discord.Client):
         log.info("Connected as %s; filing reports on %s.", self.user, self.repo.full_name)
 
     async def on_message(self, message: discord.Message) -> None:
-        # A new post is recorded when its starter message arrives, not on thread
-        # create: with an attachment, the thread exists seconds before its message.
         thread = message.channel
-        if not isinstance(thread, discord.Thread) or message.id != thread.id:
+        if not isinstance(thread, discord.Thread):
             return
         if self.forum is None or thread.parent_id != self.forum.id:
             return
         if message.author == self.user:
             return
         try:
-            await self.record_post(thread, message)
+            # A new post is recorded when its starter message arrives, not on thread
+            # create: with an attachment, the thread exists seconds before its message.
+            if message.id == thread.id:
+                await self.record_post(thread, message)
+            else:
+                await self.forward_replies(thread)
         except Exception:
-            log.exception("Could not record post %s (%r).", thread.id, thread.name)
+            log.exception("Could not copy message %s in %r to GitHub.", message.id, thread.name)
 
     async def record_post(
         self, thread: discord.Thread, starter: discord.Message | None = None
@@ -95,7 +106,7 @@ class JeanPaul(discord.Client):
         assert self.forum is not None
         open_tag = _tag(self.forum, OPEN_TAG)
         closed_tag = _tag(self.forum, CLOSED_TAG)
-        async with self._record_lock:
+        async with self._write_lock:
             if open_tag in thread.applied_tags or closed_tag in thread.applied_tags:
                 return
 
@@ -117,6 +128,27 @@ class JeanPaul(discord.Client):
             if not await self._has_replied(thread, issue_url):
                 await thread.send(f"Recorded as [#{number}](<{issue_url}>).")
             await thread.add_tags(open_tag)
+
+    async def forward_replies(self, thread: discord.Thread) -> None:
+        """Comment every reply newer than the last one forwarded, oldest first.
+
+        Stops at the first failure, so the next try resumes without skipping or
+        reordering anything.
+        """
+        async with self._write_lock:
+            number = self.thread_issues.get(thread.id)
+            if number is None:
+                log.warning("Post %s has no issue yet; its replies wait.", thread.id)
+                return
+            # The starter message shares the thread's id, so replies come after it.
+            after = discord.Object(self.newest_forwarded.get(thread.id, thread.id))
+            async for message in thread.history(limit=None, after=after, oldest_first=True):
+                if message.author != self.user and message.type in FORWARDED_TYPES:
+                    await asyncio.to_thread(
+                        github.add_comment, self.repo, number, report.comment_body(message)
+                    )
+                    log.info("Forwarded message %s to issue #%d.", message.id, number)
+                self.newest_forwarded[thread.id] = message.id
 
     async def _has_replied(self, thread: discord.Thread, issue_url: str) -> bool:
         async for message in thread.history(limit=REPLY_SEARCH_LIMIT):
