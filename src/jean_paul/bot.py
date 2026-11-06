@@ -70,7 +70,11 @@ class JeanPaul(discord.Client):
             self.config.github_private_key,
             self.config.github_repo,
         )
-        self.setup_problems += await asyncio.to_thread(github.check_repo, self.repo)
+        # Refuse here, before the gateway identifies: Discord resets the token of a bot
+        # that identifies more than 1000 times a day, and systemd restarts a refusal.
+        problems = await asyncio.to_thread(github.check_repo, self.repo)
+        if problems:
+            raise SetupError("\n".join(problems))
 
     async def on_ready(self) -> None:
         # on_ready fires again after a fresh session, which means events were missed.
@@ -306,7 +310,16 @@ class JeanPaul(discord.Client):
         for thread in posts:
             if thread.owner_id != self.user.id or thread.id in self.thread_issues:
                 continue
-            starter = await thread.fetch_message(thread.id)
+            try:
+                starter = await thread.fetch_message(thread.id)
+            except discord.NotFound:
+                log.warning(
+                    "Post %s (%r) lost its first message, so it no longer links to an issue. "
+                    "Delete it.",
+                    thread.id,
+                    thread.name,
+                )
+                continue
             number = report.issue_number_in_post(starter.content, self.repo.html_url)
             if number is not None:
                 index[thread.id] = number

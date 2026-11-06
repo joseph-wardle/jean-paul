@@ -1,13 +1,13 @@
 # A systemd user service.
 [Unit]
 Description=Jean Paul: Discord forum posts as GitHub issues
-StartLimitIntervalSec=0
 
 [Service]
 WorkingDirectory=%h/jean-paul
 ExecStart=%h/jean-paul/.venv/bin/jean-paul
 Restart=always
-RestartSec=30
+# At most 720 starts a day; Discord resets the token after 1000 identifies a day.
+RestartSec=120
 
 [Install]
 WantedBy=default.target
