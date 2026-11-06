@@ -30,7 +30,7 @@ MAINTAINER_PERMISSIONS = ("view_channel", "send_messages")
 # System messages (pins, renames) are not part of the conversation.
 FORWARDED_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 
-# How far back to look for an earlier "Recorded as" reply after an interrupted run.
+# How far back to look for the bot's own earlier message before sending one again.
 REPLY_SEARCH_LIMIT = 50
 
 POLL_SECONDS = 60
@@ -54,7 +54,8 @@ class JeanPaul(discord.Client):
         self.setup_problems: list[str] = []
         self.forum: discord.ForumChannel | None = None
         self.thread_issues: dict[int, int] = {}
-        self.newest_forwarded: dict[int, int] = {}
+        # Thread id to the newest message this run forwarded or skipped.
+        self.newest_handled: dict[int, int] = {}
         # One write at a time: two events for one report can't both create its other
         # half, and replies reach GitHub in Discord order.
         self._write_lock = asyncio.Lock()
@@ -86,8 +87,8 @@ class JeanPaul(discord.Client):
         if forum is None or self.setup_problems:
             await self.close()
             return
-        # The indexes must exist before live events are handled, or a reply would
-        # forward its whole thread again.
+        # The index must exist before live events are handled, or a reply in an
+        # existing post would find no issue.
         try:
             await self._rebuild_indexes(await _forum_posts(forum))
         except Exception:
@@ -148,7 +149,7 @@ class JeanPaul(discord.Client):
                 log.info("Recorded post %s as issue #%d.", thread.id, number)
 
             issue_url = f"{self.repo.html_url}/issues/{number}"
-            if not await self._has_replied(thread, issue_url):
+            if not any(issue_url in text for text in await self._bot_messages(thread)):
                 await thread.send(f"Recorded as [#{number}](<{issue_url}>).")
             await thread.add_tags(open_tag)
             log.info("Tagged post %s Open for issue #%d.", thread.id, number)
@@ -164,24 +165,44 @@ class JeanPaul(discord.Client):
             if number is None:
                 log.warning("Post %s has no issue yet; its replies wait.", thread.id)
                 return
-            # The starter message shares the thread's id, so replies come after it.
-            after = discord.Object(self.newest_forwarded.get(thread.id, thread.id))
-            async for message in thread.history(limit=None, after=after, oldest_first=True):
+            # GitHub is ahead after a comment whose reply was lost; this run is ahead after
+            # messages it skipped. The starter message shares the thread's id.
+            on_github = await asyncio.to_thread(
+                github.newest_forwarded, self.repo, number, self.bot_login
+            )
+            after = max(on_github or thread.id, self.newest_handled.get(thread.id, thread.id))
+            async for message in thread.history(
+                limit=None, after=discord.Object(after), oldest_first=True
+            ):
                 if message.author != self.user and message.type in FORWARDED_TYPES:
                     await asyncio.to_thread(
                         github.add_comment, self.repo, number, report.comment_body(message)
                     )
                     log.info("Forwarded message %s to issue #%d.", message.id, number)
-                self.newest_forwarded[thread.id] = message.id
+                self.newest_handled[thread.id] = message.id
 
     async def reconcile_issue(self, issue: Issue) -> None:
-        """Give a labelled issue its post and its thread marker, and match the post's tag
-        to the issue's state."""
+        """Give a labelled issue its post, and match the post's tag to the issue's state."""
+        assert self.forum is not None
         async with self._write_lock:
-            thread_id = next(
-                (thread for thread, number in self.thread_issues.items() if number == issue.number),
-                None,
-            )
+            if issue.user.login == self.bot_login:
+                # The bot writes an issue only for a forum post, and names the post in it.
+                thread_id = report.thread_id_in(issue.body)
+                if thread_id is None:
+                    log.warning(
+                        "Issue #%d lost its hidden discord-thread line, so it can't find its "
+                        "post. Restore the line from the issue's edit history.",
+                        issue.number,
+                    )
+                    return
+                self.thread_issues[thread_id] = issue.number
+            else:
+                thread_id = self._thread_of(issue.number)
+                if thread_id is None:
+                    # A post whose creation reply was lost is already in the forum.
+                    self.thread_issues |= await self._index_bot_posts(self.forum.threads)
+                    thread_id = self._thread_of(issue.number)
+
             if thread_id is None:
                 thread = await self._create_post(issue)
             else:
@@ -197,9 +218,6 @@ class JeanPaul(discord.Client):
                     )
                     return
                 assert isinstance(thread, discord.Thread)
-
-            if report.thread_id_in(issue.body) != thread.id:
-                await asyncio.to_thread(github.add_thread_marker, issue, thread.id)
             await self._sync_status(thread, issue)
 
     async def _keep_in_sync(self) -> None:
@@ -249,22 +267,15 @@ class JeanPaul(discord.Client):
         return max(issue.updated_at for issue in issues)
 
     async def _rebuild_indexes(self, posts: list[discord.Thread]) -> None:
-        """Re-read both indexes from GitHub and the forum.
+        """Re-read which post belongs to which issue, from GitHub and the forum.
 
         Merged into what this run already knows, so a write GitHub hasn't listed yet
-        is never forgotten and a reply is never forwarded twice.
+        is never forgotten.
         """
         self.thread_issues |= await asyncio.to_thread(
             github.thread_index, self.repo, self.bot_login
         )
         self.thread_issues |= await self._index_bot_posts(posts)
-        forwarded = await asyncio.to_thread(
-            github.newest_forwarded, self.repo, self.bot_login, self.thread_issues
-        )
-        for thread_id, message_id in forwarded.items():
-            self.newest_forwarded[thread_id] = max(
-                message_id, self.newest_forwarded.get(thread_id, 0)
-            )
 
     async def _create_post(self, issue: Issue) -> discord.Thread:
         assert self.forum is not None
@@ -295,7 +306,11 @@ class JeanPaul(discord.Client):
 
         if thread.archived:
             thread = await thread.edit(archived=False)
-        await thread.send(report.status_line(issue.state, issue.state_reason))
+        line = report.status_line(issue.state, issue.state_reason)
+        # Sent before the tag changes, so a retry after a failed edit finds it already said.
+        said = await self._bot_messages(thread)
+        if not said or said[0] != line:
+            await thread.send(line)
         others = [tag for tag in tags if tag not in (open_tag, closed_tag)]
         await thread.edit(applied_tags=[*others, wanted], archived=not is_open)
         log.info("Marked post %s %s for issue #%d.", thread.id, wanted.name, issue.number)
@@ -325,16 +340,21 @@ class JeanPaul(discord.Client):
                 index[thread.id] = number
         return index
 
+    def _thread_of(self, number: int) -> int | None:
+        return next((thread for thread, n in self.thread_issues.items() if n == number), None)
+
     def _has_unforwarded(self, thread: discord.Thread) -> bool:
-        # Saves a history request per post per sweep; unknown means look.
-        newest = self.newest_forwarded.get(thread.id, thread.id)
+        # Saves two requests per post per sweep; unknown means look.
+        newest = self.newest_handled.get(thread.id, thread.id)
         return thread.last_message_id is None or thread.last_message_id > newest
 
-    async def _has_replied(self, thread: discord.Thread, issue_url: str) -> bool:
-        async for message in thread.history(limit=REPLY_SEARCH_LIMIT):
-            if message.author == self.user and issue_url in message.content:
-                return True
-        return False
+    async def _bot_messages(self, thread: discord.Thread) -> list[str]:
+        """The text of the bot's recent messages in the post, newest first."""
+        return [
+            message.content
+            async for message in thread.history(limit=REPLY_SEARCH_LIMIT)
+            if message.author == self.user
+        ]
 
     def _status_tags(self) -> tuple[discord.ForumTag, discord.ForumTag]:
         assert self.forum is not None

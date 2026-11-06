@@ -50,25 +50,18 @@ def thread_index(repo: Repository, bot_login: str) -> dict[int, int]:
     return index
 
 
-def newest_forwarded(
-    repo: Repository, bot_login: str, thread_issues: dict[int, int]
-) -> dict[int, int]:
-    """Map forum thread id to the newest Discord message the bot forwarded from it.
+def newest_forwarded(repo: Repository, number: int, bot_login: str) -> int | None:
+    """The newest Discord message the bot forwarded to issue `number`, if any.
 
-    One repo-wide listing of comments; only the bot's own comments are trusted.
+    Only the bot's own comments are trusted.
     """
-    thread_of_issue = {number: thread_id for thread_id, number in thread_issues.items()}
-    newest: dict[int, int] = {}
-    for comment in repo.get_issues_comments():
-        if comment.user.login != bot_login:
-            continue
-        message_id = report.message_id_in(comment.body)
-        thread_id = thread_of_issue.get(_issue_number(comment.issue_url))
-        if message_id is None or thread_id is None:
-            continue
-        # Discord ids grow with time, so the largest is the newest.
-        newest[thread_id] = max(message_id, newest.get(thread_id, 0))
-    return newest
+    forwarded = [
+        report.message_id_in(comment.body)
+        for comment in repo.get_issue(number).get_comments()
+        if comment.user.login == bot_login
+    ]
+    # Discord ids grow with time, so the largest is the newest.
+    return max((message_id for message_id in forwarded if message_id is not None), default=None)
 
 
 def labelled_issues(repo: Repository, since: datetime | None) -> list[Issue]:
@@ -83,17 +76,9 @@ def labelled_issues(repo: Repository, since: datetime | None) -> list[Issue]:
     return [issue for issue in issues if issue.pull_request is None]
 
 
-def add_thread_marker(issue: Issue, thread_id: int) -> None:
-    issue.edit(body=f"{issue.body or ''}\n\n{report.THREAD_MARKER.format(thread_id)}".lstrip())
-
-
 def create_report_issue(repo: Repository, title: str, body: str) -> Issue:
     return repo.create_issue(title=title, body=body, labels=[REPORT_LABEL])
 
 
 def add_comment(repo: Repository, number: int, body: str) -> None:
     repo.get_issue(number).create_comment(body)
-
-
-def _issue_number(issue_url: str) -> int:
-    return int(issue_url.rsplit("/", 1)[1])
