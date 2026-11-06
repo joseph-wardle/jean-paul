@@ -1,0 +1,13 @@
+# A systemd user service.
+[Unit]
+Description=Jean Paul: Discord forum posts as GitHub issues
+StartLimitIntervalSec=0
+
+[Service]
+WorkingDirectory=%h/jean-paul
+ExecStart=%h/jean-paul/.venv/bin/jean-paul
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target
