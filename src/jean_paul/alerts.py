@@ -34,12 +34,7 @@ class ChannelAlerts(logging.Handler):
             return
         self._last_sent[text] = now
 
-        try:
-            task = asyncio.get_running_loop().create_task(self._send(text, record))
-        except RuntimeError:
-            # Logged from a worker thread, away from the event loop.
-            self.handleError(record)
-            return
+        task = asyncio.get_running_loop().create_task(self._send(text, record))
         self._sending.add(task)
         task.add_done_callback(self._sending.discard)
 

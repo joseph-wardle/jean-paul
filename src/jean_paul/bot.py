@@ -1,4 +1,4 @@
-"""The Discord side: checks the forum setup, then keeps forum posts and issues in step."""
+"""The bot: checks its setup on both platforms, then keeps forum posts and issues in step."""
 
 import asyncio
 import logging
@@ -36,7 +36,6 @@ REPLY_SEARCH_LIMIT = 50
 POLL_SECONDS = 60
 # The sweep re-reads both platforms: a retry net for anything a live event missed.
 SWEEP_SECONDS = 15 * 60
-THREAD_NAME_LIMIT = 100
 
 
 class SetupError(Exception):
@@ -52,6 +51,7 @@ class JeanPaul(discord.Client):
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.config = config
         self.setup_problems: list[str] = []
+        # Thread id to issue number, for every report this run knows of.
         self.thread_issues: dict[int, int] = {}
         # Thread id to the newest message this run forwarded or skipped.
         self.newest_handled: dict[int, int] = {}
@@ -65,7 +65,6 @@ class JeanPaul(discord.Client):
         self._next_sweep = 0.0
 
     async def setup_hook(self) -> None:
-        # PyGithub is synchronous; keep it off the event loop.
         self.repo: Repository
         self.repo, self.bot_login = await asyncio.to_thread(
             github.connect,
@@ -86,6 +85,8 @@ class JeanPaul(discord.Client):
             return
         self.setup_problems = self._check_discord()
         if self.setup_problems:
+            # Not raised: discord.py logs and swallows an event handler's exception.
+            # run() raises them once the client has closed.
             await self.close()
             return
         maintainer = self.get_channel(self.config.maintainer_channel_id)
@@ -117,11 +118,10 @@ class JeanPaul(discord.Client):
     ) -> None:
         """Give a forum post its issue, its "Recorded as" reply and its Open tag.
 
-        Each step checks for the one before it, so an interrupted run can be repeated.
+        Each step is skipped when already done, so an interrupted run can be repeated.
         """
-        open_tag, closed_tag = self._status_tags()
         async with self._write_lock:
-            if open_tag in thread.applied_tags or closed_tag in thread.applied_tags:
+            if self._is_recorded(thread):
                 return
 
             number = self.thread_issues.get(thread.id)
@@ -140,7 +140,8 @@ class JeanPaul(discord.Client):
 
             issue_url = f"{self.repo.html_url}/issues/{number}"
             if not any(issue_url in text for text in await self._bot_messages(thread)):
-                await thread.send(f"Recorded as [#{number}](<{issue_url}>).")
+                await thread.send(report.recorded_line(number, issue_url))
+            open_tag, _ = self._status_tags()
             await thread.add_tags(open_tag)
             log.info("Tagged post %s Open for issue #%d.", thread.id, number)
 
@@ -210,8 +211,6 @@ class JeanPaul(discord.Client):
             await self._sync_status(thread, issue)
 
     async def _keep_in_sync(self) -> None:
-        """Poll GitHub every minute, and sweep both platforms at start-up, after a fresh
-        session and every SWEEP_SECONDS."""
         since: datetime | None = None
         while not self.is_closed():
             if time.monotonic() >= self._next_sweep:
@@ -271,7 +270,7 @@ class JeanPaul(discord.Client):
     async def _create_post(self, issue: Issue) -> discord.Thread:
         open_tag, _ = self._status_tags()
         created = await self.forum.create_thread(
-            name=issue.title[:THREAD_NAME_LIMIT],
+            name=report.post_title(issue.title),
             content=report.post_content(issue.body, issue.html_url, issue.number),
             applied_tags=[open_tag],
         )
@@ -280,11 +279,11 @@ class JeanPaul(discord.Client):
         return created.thread
 
     async def _sync_status(self, thread: discord.Thread, issue: Issue) -> None:
-        open_tag, closed_tag = self._status_tags()
-        tags = thread.applied_tags
-        if open_tag not in tags and closed_tag not in tags:
+        if not self._is_recorded(thread):
             # A forum post whose recording was interrupted; record_post finishes it.
             return
+        open_tag, closed_tag = self._status_tags()
+        tags = thread.applied_tags
 
         is_open = issue.state == "open"
         wanted = open_tag if is_open else closed_tag
@@ -329,6 +328,10 @@ class JeanPaul(discord.Client):
             if number is not None:
                 index[thread.id] = number
         return index
+
+    def _is_recorded(self, thread: discord.Thread) -> bool:
+        open_tag, closed_tag = self._status_tags()
+        return open_tag in thread.applied_tags or closed_tag in thread.applied_tags
 
     def _thread_of(self, number: int) -> int | None:
         return next((thread for thread, n in self.thread_issues.items() if n == number), None)

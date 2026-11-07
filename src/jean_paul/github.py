@@ -41,9 +41,8 @@ def thread_index(repo: Repository, bot_login: str) -> dict[int, int]:
     Markers in other people's issues are ignored: anyone can write in a public repo.
     """
     index = {}
-    for issue in repo.get_issues(state="all"):
-        if issue.user.login != bot_login:
-            continue
+    # PyGithub sends a login string as is, though its annotation wants a NamedUser.
+    for issue in repo.get_issues(state="all", creator=bot_login):  # ty: ignore[invalid-argument-type]
         thread_id = report.thread_id_in(issue.body)
         if thread_id is not None:
             index[thread_id] = issue.number
