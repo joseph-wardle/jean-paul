@@ -52,7 +52,6 @@ class JeanPaul(discord.Client):
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.config = config
         self.setup_problems: list[str] = []
-        self.forum: discord.ForumChannel | None = None
         self.thread_issues: dict[int, int] = {}
         # Thread id to the newest message this run forwarded or skipped.
         self.newest_handled: dict[int, int] = {}
@@ -60,7 +59,10 @@ class JeanPaul(discord.Client):
         # half, and replies reach GitHub in Discord order.
         self._write_lock = asyncio.Lock()
         self._sync: asyncio.Task[None] | None = None
-        self._sweep_due = True
+        # Live events wait for the first sweep's index, or a reply in an existing post
+        # would find no issue. The sweep itself handles what they skip.
+        self._indexed = False
+        self._next_sweep = 0.0
 
     async def setup_hook(self) -> None:
         # PyGithub is synchronous; keep it off the event loop.
@@ -80,27 +82,15 @@ class JeanPaul(discord.Client):
     async def on_ready(self) -> None:
         # on_ready fires again after a fresh session, which means events were missed.
         if self._sync is not None:
-            self._sweep_due = True
+            self._next_sweep = 0.0
             return
-        forum, problems = self._check_discord()
-        self.setup_problems += problems
-        if forum is None or self.setup_problems:
-            await self.close()
-            return
-        # The index must exist before live events are handled, or a reply in an
-        # existing post would find no issue.
-        try:
-            await self._rebuild_indexes(await _forum_posts(forum))
-        except Exception:
-            # Exit, and let systemd retry, rather than run without the indexes.
-            log.exception("Could not read the existing reports.")
-            self.setup_problems.append("Could not read the existing reports; see the error above.")
+        self.setup_problems = self._check_discord()
+        if self.setup_problems:
             await self.close()
             return
         maintainer = self.get_channel(self.config.maintainer_channel_id)
         assert isinstance(maintainer, discord.TextChannel)
         log.addHandler(alerts.ChannelAlerts(maintainer))
-        self.forum = forum
         self._sync = asyncio.create_task(self._keep_in_sync())
         log.info("Connected as %s; filing reports on %s.", self.user, self.repo.full_name)
 
@@ -108,7 +98,7 @@ class JeanPaul(discord.Client):
         thread = message.channel
         if not isinstance(thread, discord.Thread):
             return
-        if self.forum is None or thread.parent_id != self.forum.id:
+        if thread.parent_id != self.config.forum_id or not self._indexed:
             return
         if message.author == self.user:
             return
@@ -183,7 +173,6 @@ class JeanPaul(discord.Client):
 
     async def reconcile_issue(self, issue: Issue) -> None:
         """Give a labelled issue its post, and match the post's tag to the issue's state."""
-        assert self.forum is not None
         async with self._write_lock:
             if issue.user.login == self.bot_login:
                 # The bot writes an issue only for a forum post, and names the post in it.
@@ -224,25 +213,26 @@ class JeanPaul(discord.Client):
         """Poll GitHub every minute, and sweep both platforms at start-up, after a fresh
         session and every SWEEP_SECONDS."""
         since: datetime | None = None
-        next_sweep = 0.0
         while not self.is_closed():
-            try:
-                if self._sweep_due or time.monotonic() >= next_sweep:
-                    await self._sweep_posts()
-                    # The GitHub half of the sweep: every labelled issue, not just changes.
-                    since = None
-                    self._sweep_due = False
-                    next_sweep = time.monotonic() + SWEEP_SECONDS
-                since = await self._poll_issues(since)
-            except Exception:
-                log.exception("Syncing failed; retrying in %d s.", POLL_SECONDS)
+            if time.monotonic() >= self._next_sweep:
+                try:
+                    since = await self._sweep()
+                    self._next_sweep = time.monotonic() + SWEEP_SECONDS
+                except Exception:
+                    log.exception("The sweep failed; retrying in %d s.", POLL_SECONDS)
+            else:
+                try:
+                    since = await self._poll_issues(since)
+                except Exception:
+                    log.exception("Polling GitHub failed; retrying in %d s.", POLL_SECONDS)
             await asyncio.sleep(POLL_SECONDS)
 
-    async def _sweep_posts(self) -> None:
-        """Record every untagged post and forward every reply not yet on GitHub."""
-        assert self.forum is not None
+    async def _sweep(self) -> datetime | None:
+        """Record every untagged post, forward every reply not yet on GitHub, then
+        reconcile every labelled issue. Return where the next poll resumes."""
         posts = await _forum_posts(self.forum)
         await self._rebuild_indexes(posts)
+        self._indexed = True
         for thread in posts:
             try:
                 await self.record_post(thread)
@@ -250,6 +240,7 @@ class JeanPaul(discord.Client):
                     await self.forward_replies(thread)
             except Exception:
                 log.exception("Could not reconcile post %s (%r).", thread.id, thread.name)
+        return await self._poll_issues(None)
 
     async def _poll_issues(self, since: datetime | None) -> datetime | None:
         """Reconcile each labelled issue updated since `since`; return where to resume."""
@@ -278,7 +269,6 @@ class JeanPaul(discord.Client):
         self.thread_issues |= await self._index_bot_posts(posts)
 
     async def _create_post(self, issue: Issue) -> discord.Thread:
-        assert self.forum is not None
         open_tag, _ = self._status_tags()
         created = await self.forum.create_thread(
             name=issue.title[:THREAD_NAME_LIMIT],
@@ -356,26 +346,32 @@ class JeanPaul(discord.Client):
             if message.author == self.user
         ]
 
+    @property
+    def forum(self) -> discord.ForumChannel:
+        # Looked up on each use: a fresh session replaces every cached channel and thread.
+        forum = self.get_channel(self.config.forum_id)
+        assert isinstance(forum, discord.ForumChannel), "The forum is not in the cache yet."
+        return forum
+
     def _status_tags(self) -> tuple[discord.ForumTag, discord.ForumTag]:
-        assert self.forum is not None
         return _tag(self.forum, OPEN_TAG), _tag(self.forum, CLOSED_TAG)
 
-    def _check_discord(self) -> tuple[discord.ForumChannel | None, list[str]]:
+    def _check_discord(self) -> list[str]:
         guild = self.get_guild(self.config.guild_id)
         if guild is None:
-            return None, [f"The bot is not in server {self.config.guild_id}. Invite it first."]
+            return [f"The bot is not in server {self.config.guild_id}. Invite it first."]
 
         forum = guild.get_channel(self.config.forum_id)
         if not isinstance(forum, discord.ForumChannel):
-            return None, [f"Channel {self.config.forum_id} is missing or is not a forum."]
+            return [f"Channel {self.config.forum_id} is missing or is not a forum."]
 
         maintainer = guild.get_channel(self.config.maintainer_channel_id)
         if not isinstance(maintainer, discord.TextChannel):
-            return None, [
+            return [
                 f"Channel {self.config.maintainer_channel_id} is missing or is not a text channel."
             ]
 
-        return forum, (
+        return (
             _check_tags(forum)
             + _check_permissions(forum, guild.me, FORUM_PERMISSIONS)
             + _check_permissions(maintainer, guild.me, MAINTAINER_PERMISSIONS)
