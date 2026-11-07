@@ -1,10 +1,11 @@
 """Deployment settings and secrets, all read from one directory outside the repo."""
 
+import os
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-CONFIG_DIR = Path("~/.config/jean-paul").expanduser()
+CONFIG_DIR = Path(os.environ.get("JEAN_PAUL_CONFIG_DIR", "~/.config/jean-paul")).expanduser()
 SETTINGS_FILE = CONFIG_DIR / "config.toml"
 DISCORD_TOKEN_FILE = CONFIG_DIR / "discord_token"
 GITHUB_KEY_FILE = CONFIG_DIR / "github_app.pem"
