@@ -22,6 +22,7 @@ class Config:
     maintainer_channel_id: int
     github_app_id: int
     github_repo: str
+    attachments_repo: str
     discord_token: str
     github_private_key: str
 
@@ -37,6 +38,7 @@ def load_config() -> Config:
             maintainer_channel_id=int(discord_settings["maintainer_channel_id"]),
             github_app_id=int(github_settings["app_id"]),
             github_repo=str(github_settings["repo"]),
+            attachments_repo=str(github_settings["attachments_repo"]),
             discord_token=_read_secret(DISCORD_TOKEN_FILE),
             github_private_key=_read_secret(GITHUB_KEY_FILE),
         )

@@ -1,11 +1,13 @@
 """The bot: checks its setup on both platforms, then keeps forum posts and issues in step."""
 
 import asyncio
+import io
 import logging
 import time
 from datetime import datetime
 
 import discord
+from github.GithubException import GithubException
 from github.Issue import Issue
 from github.Repository import Repository
 
@@ -32,6 +34,9 @@ FORWARDED_TYPES = (discord.MessageType.default, discord.MessageType.reply)
 
 # How far back to look for the bot's own earlier message before sending one again.
 REPLY_SEARCH_LIMIT = 50
+
+# Discord's limit of files per message.
+MAX_FILES = 10
 
 POLL_SECONDS = 60
 # The sweep re-reads both platforms: a retry net for anything a live event missed.
@@ -66,15 +71,17 @@ class JeanPaul(discord.Client):
 
     async def setup_hook(self) -> None:
         self.repo: Repository
-        self.repo, self.bot_login = await asyncio.to_thread(
+        self.attachments: Repository
+        self.repo, self.attachments, self.bot_login = await asyncio.to_thread(
             github.connect,
             self.config.github_app_id,
             self.config.github_private_key,
             self.config.github_repo,
+            self.config.attachments_repo,
         )
         # Refuse here, before the gateway identifies: Discord resets the token of a bot
         # that identifies more than 1000 times a day, and systemd restarts a refusal.
-        problems = await asyncio.to_thread(github.check_repo, self.repo)
+        problems = await asyncio.to_thread(github.check_repo, self.repo, self.attachments)
         if problems:
             raise SetupError("\n".join(problems))
 
@@ -128,11 +135,12 @@ class JeanPaul(discord.Client):
             if number is None:
                 if starter is None:
                     starter = await thread.fetch_message(thread.id)
+                copied = await self._copy_attachments(starter)
                 issue = await asyncio.to_thread(
                     github.create_report_issue,
                     self.repo,
                     thread.name,
-                    report.issue_body(starter),
+                    report.issue_body(starter, copied),
                 )
                 number = issue.number
                 self.thread_issues[thread.id] = number
@@ -166,9 +174,8 @@ class JeanPaul(discord.Client):
                 limit=None, after=discord.Object(after), oldest_first=True
             ):
                 if message.author != self.user and message.type in FORWARDED_TYPES:
-                    await asyncio.to_thread(
-                        github.add_comment, self.repo, number, report.comment_body(message)
-                    )
+                    body = report.comment_body(message, await self._copy_attachments(message))
+                    await asyncio.to_thread(github.add_comment, self.repo, number, body)
                     log.info("Forwarded message %s to issue #%d.", message.id, number)
                 self.newest_handled[thread.id] = message.id
 
@@ -208,6 +215,8 @@ class JeanPaul(discord.Client):
                     )
                     return
                 assert isinstance(thread, discord.Thread)
+            # Comments first, so a closing comment comes before "Closed on GitHub".
+            await self._mirror_comments(thread, issue)
             await self._sync_status(thread, issue)
 
     async def _keep_in_sync(self) -> None:
@@ -272,11 +281,72 @@ class JeanPaul(discord.Client):
         created = await self.forum.create_thread(
             name=report.post_title(issue.title),
             content=report.post_content(issue.body, issue.html_url, issue.number),
+            files=await self._github_files(issue.body),
             applied_tags=[open_tag],
         )
         self.thread_issues[created.thread.id] = issue.number
         log.info("Posted issue #%d as post %s.", issue.number, created.thread.id)
         return created.thread
+
+    async def _mirror_comments(self, thread: discord.Thread, issue: Issue) -> None:
+        """Post each GitHub comment the post hasn't shown yet, oldest first.
+
+        Stops at the first failure, so the next try resumes without skipping or
+        reordering anything.
+        """
+        if issue.comments == 0 or not self._is_recorded(thread):
+            return
+        # The bot's own messages say which comments it already mirrored.
+        mirrored = [
+            report.comment_id_in(text) for text in await self._bot_messages(thread, limit=None)
+        ]
+        after = max((id for id in mirrored if id is not None), default=0)
+        comments = await asyncio.to_thread(
+            github.comments_after, self.repo, issue.number, after, self.bot_login
+        )
+        for comment in comments:
+            await thread.send(
+                report.comment_message(comment.user.login, comment.html_url, comment.body),
+                files=await self._github_files(comment.body),
+            )
+            log.info("Mirrored comment %s on issue #%d.", comment.id, issue.number)
+        if comments and thread.archived and issue.state == "closed":
+            # Sending un-archived it.
+            await thread.edit(archived=True)
+
+    async def _copy_attachments(self, message: discord.Message) -> report.Copied:
+        """Copy each of the message's files to the attachments repo."""
+        copied: report.Copied = []
+        for attachment in message.attachments:
+            path = report.attachment_path(message, attachment)
+            try:
+                content = await attachment.read()
+                link = await asyncio.to_thread(
+                    github.store_attachment, self.attachments, path, content
+                )
+            except (discord.HTTPException, GithubException):
+                # Named instead, or one file GitHub refuses would hold back every later reply.
+                log.warning(
+                    "Could not copy %s to GitHub, so the issue names it instead.",
+                    path,
+                    exc_info=True,
+                )
+                link = None
+            copied.append((attachment, link))
+        return copied
+
+    async def _github_files(self, body: str | None) -> list[discord.File]:
+        """The files pasted into a GitHub text. One that can't be sent stays a link."""
+        files = []
+        for url in report.github_files(body)[:MAX_FILES]:
+            try:
+                name, content = await asyncio.to_thread(github.download, url)
+            except OSError:
+                log.warning("Could not download %s, so Discord gets its link.", url, exc_info=True)
+                continue
+            if len(content) <= self.forum.guild.filesize_limit:
+                files.append(discord.File(io.BytesIO(content), filename=name))
+        return files
 
     async def _sync_status(self, thread: discord.Thread, issue: Issue) -> None:
         if not self._is_recorded(thread):
@@ -341,11 +411,13 @@ class JeanPaul(discord.Client):
         newest = self.newest_handled.get(thread.id, thread.id)
         return thread.last_message_id is None or thread.last_message_id > newest
 
-    async def _bot_messages(self, thread: discord.Thread) -> list[str]:
+    async def _bot_messages(
+        self, thread: discord.Thread, limit: int | None = REPLY_SEARCH_LIMIT
+    ) -> list[str]:
         """The text of the bot's recent messages in the post, newest first."""
         return [
             message.content
-            async for message in thread.history(limit=REPLY_SEARCH_LIMIT)
+            async for message in thread.history(limit=limit)
             if message.author == self.user
         ]
 

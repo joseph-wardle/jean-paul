@@ -14,3 +14,5 @@ maintainer_channel_id = 0
 app_id = 0
 # The repository the App is installed on, where reports become issues.
 repo = "owner/name"
+# A public repository, also with the App installed, holding files copied from Discord.
+attachments_repo = "owner/name-attachments"
