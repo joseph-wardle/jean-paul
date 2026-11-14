@@ -1,5 +1,3 @@
-"""The bot: checks its setup on both platforms, then keeps forum posts and issues in step."""
-
 import asyncio
 import io
 import logging
@@ -11,7 +9,7 @@ from github.GithubException import GithubException
 from github.Issue import Issue
 from github.Repository import Repository
 
-from jean_paul import alerts, github, report
+from jean_paul import alerts, github, notes, report, shotgrid
 from jean_paul.config import Config
 
 log = logging.getLogger(__name__)
@@ -79,9 +77,14 @@ class JeanPaul(discord.Client):
             self.config.github_repo,
             self.config.attachments_repo,
         )
+        sg = shotgrid.connect(
+            self.config.shotgrid_site, self.config.shotgrid_script, self.config.shotgrid_key
+        )
+        self.notes = notes.NoteDelivery(self, sg, self.config.shotgrid_project_id)
         # Refuse here, before the gateway identifies: Discord resets the token of a bot
         # that identifies more than 1000 times a day, and systemd restarts a refusal.
         problems = await asyncio.to_thread(github.check_repo, self.repo, self.attachments)
+        problems += await asyncio.to_thread(shotgrid.check_schema, sg)
         if problems:
             raise SetupError("\n".join(problems))
 
@@ -233,6 +236,10 @@ class JeanPaul(discord.Client):
                     since = await self._poll_issues(since)
                 except Exception:
                     log.exception("Polling GitHub failed; retrying in %d s.", POLL_SECONDS)
+            try:
+                await self.notes.deliver()
+            except Exception:
+                log.exception("Delivering ShotGrid notes failed; retrying in %d s.", POLL_SECONDS)
             await asyncio.sleep(POLL_SECONDS)
 
     async def _sweep(self) -> datetime | None:

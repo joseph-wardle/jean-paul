@@ -9,6 +9,7 @@ CONFIG_DIR = Path(os.environ.get("JEAN_PAUL_CONFIG_DIR", "~/.config/jean-paul"))
 SETTINGS_FILE = CONFIG_DIR / "config.toml"
 DISCORD_TOKEN_FILE = CONFIG_DIR / "discord_token"
 GITHUB_KEY_FILE = CONFIG_DIR / "github_app.pem"
+SHOTGRID_KEY_FILE = CONFIG_DIR / "shotgrid_key"
 
 
 class ConfigError(Exception):
@@ -25,6 +26,10 @@ class Config:
     attachments_repo: str
     discord_token: str
     github_private_key: str
+    shotgrid_site: str
+    shotgrid_script: str
+    shotgrid_project_id: int
+    shotgrid_key: str
 
 
 def load_config() -> Config:
@@ -32,6 +37,7 @@ def load_config() -> Config:
     try:
         discord_settings = settings["discord"]
         github_settings = settings["github"]
+        shotgrid_settings = settings["shotgrid"]
         return Config(
             guild_id=int(discord_settings["guild_id"]),
             forum_id=int(discord_settings["forum_id"]),
@@ -41,6 +47,10 @@ def load_config() -> Config:
             attachments_repo=str(github_settings["attachments_repo"]),
             discord_token=_read_secret(DISCORD_TOKEN_FILE),
             github_private_key=_read_secret(GITHUB_KEY_FILE),
+            shotgrid_site=str(shotgrid_settings["site"]),
+            shotgrid_script=str(shotgrid_settings["script_name"]),
+            shotgrid_project_id=int(shotgrid_settings["project_id"]),
+            shotgrid_key=_read_secret(SHOTGRID_KEY_FILE),
         )
     except KeyError as missing:
         raise ConfigError(

@@ -1,6 +1,6 @@
 # A systemd user service.
 [Unit]
-Description=Jean Paul: Discord forum posts as GitHub issues
+Description=Jean Paul: Discord forum posts as GitHub issues, and ShotGrid note DMs
 
 [Service]
 WorkingDirectory=%h/jean-paul
