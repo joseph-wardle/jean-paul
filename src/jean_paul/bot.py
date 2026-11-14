@@ -372,11 +372,15 @@ class JeanPaul(discord.Client):
 
         if thread.archived:
             thread = await thread.edit(archived=False)
-        line = report.status_line(issue.state, issue.state_reason)
+        closer = None
+        if not is_open:
+            closer = await asyncio.to_thread(github.closer, self.repo, issue.number)
+        line = report.status_line(issue.state, issue.state_reason, issue.number, closer)
         # Sent before the tag changes, so a retry after a failed edit finds it already said.
         said = await self._bot_messages(thread)
         if not said or said[0] != line:
-            await thread.send(line)
+            gif = None if is_open else report.closing_gif(issue.state_reason, issue.number)
+            await thread.send(line, embeds=[gif] if gif else [])
         others = [tag for tag in tags if tag not in (open_tag, closed_tag)]
         await thread.edit(applied_tags=[*others, wanted], archived=not is_open)
         log.info("Marked post %s %s for issue #%d.", thread.id, wanted.name, issue.number)
