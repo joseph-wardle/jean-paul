@@ -1,8 +1,10 @@
 """How a report is written on each platform, and how the bot finds its other half."""
 
 import re
+from typing import NamedTuple
 
 import discord
+from discord.utils import escape_markdown
 
 # Hidden in the issue body; links the issue to its forum post.
 _THREAD_MARKER = "<!-- discord-thread: {} -->"
@@ -31,13 +33,51 @@ DISCORD_MESSAGE_LIMIT = 2000
 THREAD_NAME_LIMIT = 100
 HTML_COMMENT_PATTERN = re.compile(r"<!--.*?-->", re.DOTALL)
 
-CLOSED_LINES = {
-    "completed": "Closed on GitHub as done.",
-    "not_planned": "Closed on GitHub as not planned.",
-    "duplicate": "Closed on GitHub as a duplicate.",
+STATUS_LINES = {
+    "completed": (
+        "Splendid. This has been seen to{fix}.",
+        "Consider the matter handled{fix}.",
+        "Right as rain{fix}. This calls for some marmelade!",
+        "Sorted{fix}. Father would have been proud.",
+    ),
+    "not_planned": (
+        "After some deliberation in the drawing room, we shan't be pursuing this one. My sincere apologies.",
+        "Not to be, I'm afraid. The estate's attentions lie elsewhere for now.",
+        "Set aside for the present. Do raise it again should circumstances change.",
+        "Perhaps another time. For the moment we have more pressing matters to attend to."
+    ),
+    "duplicate": (
+        "Ah, we've been over this one before. It's being looked after in another report.",
+        "This matter is already in hand elsewhere, I'm pleased to say.",
+        "I daresay I've seen this one before already. I think it's being taken care of."
+    ),
+    "closed": ("This one has been closed. Good day.",),
+    "reopened": (
+        "Back again, I see. This one's been reopened.",
+        "On reflection, this matter is open once more.",
+        "Reopened. One mustn't let these things linger.",
+    ),
 }
-CLOSED_LINE = "Closed on GitHub."
-REOPENED_LINE = "Reopened on GitHub."
+
+RECORDED_LINES = (
+    "Duly noted. I've had this entered into the ledger as {issue}.",
+    "I've passed this along to the estate's engineer as {issue}.",
+    "Thank you for bringing this to out attention. It's on file as {issue}.",
+    "Noted, and filed away as {issue}.",
+    "I shall see that this is looked into. It's recorded as {issue}.",
+    "Ah, a new matter. I've written it up as {issue}.",
+    "Hmm, interesting. I'll send word right away. I've recorded it as {issue} for now.",
+)
+
+CLOSING_GIFS: tuple[str, ...] = ()
+
+
+class Closer(NamedTuple):
+    """The pull request or commit that closed an issue."""
+
+    label: str
+    title: str
+    url: str
 
 
 def thread_id_in(body: str | None) -> int | None:
@@ -87,7 +127,8 @@ def discord_text(body: str | None) -> str:
 
 
 def recorded_line(number: int, issue_url: str) -> str:
-    return f"Recorded as [#{number}](<{issue_url}>)."
+    line = RECORDED_LINES[number % len(RECORDED_LINES)]
+    return line.format(issue=f"[#{number}](<{issue_url}>)")
 
 
 def issue_number_in_post(content: str, repo_url: str) -> int | None:
@@ -107,10 +148,24 @@ def post_content(body: str | None, issue_url: str, number: int) -> str:
     return f"{text}\n\n{link}" if text else link
 
 
-def status_line(state: str, state_reason: str | None) -> str:
+def status_line(
+    state: str, state_reason: str | None, number: int, closer: Closer | None = None
+) -> str:
     if state == "open":
-        return REOPENED_LINE
-    return CLOSED_LINES.get(state_reason or "", CLOSED_LINE)
+        kind = "reopened"
+    else:
+        kind = state_reason if state_reason in STATUS_LINES else "closed"
+    lines = STATUS_LINES[kind]
+    fix = ""
+    if closer is not None:
+        fix = f" in [{closer.label}](<{closer.url}>), *{escape_markdown(closer.title)}*"
+    return lines[number % len(lines)].format(fix=fix)
+
+
+def closing_gif(state_reason: str | None, number: int) -> discord.Embed | None:
+    if state_reason != "completed" or not CLOSING_GIFS:
+        return None
+    return discord.Embed().set_image(url=CLOSING_GIFS[number % len(CLOSING_GIFS)])
 
 
 def github_safe(text: str) -> str:

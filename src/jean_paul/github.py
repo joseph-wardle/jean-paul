@@ -19,6 +19,27 @@ REPORT_LABEL = "discord"
 
 DOWNLOAD_TIMEOUT_SECONDS = 30
 
+# REST names no closer when a pull request closes an issue; GraphQL does.
+_CLOSER_QUERY = """
+query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) {
+    issue(number: $number) {
+      timelineItems(itemTypes: [CLOSED_EVENT], last: 1) {
+        nodes {
+          ... on ClosedEvent {
+            closer {
+              __typename
+              ... on PullRequest { number title url }
+              ... on Commit { abbreviatedOid messageHeadline url }
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
 
 def connect(
     app_id: int, private_key: str, repo_name: str, attachments_name: str
@@ -115,6 +136,20 @@ def comments_after(repo: Repository, number: int, after: int, bot_login: str) ->
         for comment in repo.get_issue(number).get_comments()
         if comment.id > after and comment.user.login != bot_login
     ]
+
+
+def closer(repo: Repository, number: int) -> report.Closer | None:
+    """The pull request or commit that last closed issue `number`, if one did."""
+    _, data = repo.requester.graphql_query(
+        _CLOSER_QUERY, {"owner": repo.owner.login, "name": repo.name, "number": number}
+    )
+    nodes = data["data"]["repository"]["issue"]["timelineItems"]["nodes"]
+    found = nodes[0]["closer"] if nodes else None
+    if found is None:
+        return None
+    if found["__typename"] == "PullRequest":
+        return report.Closer(f"#{found['number']}", found["title"], found["url"])
+    return report.Closer(found["abbreviatedOid"], found["messageHeadline"], found["url"])
 
 
 def store_attachment(attachments: Repository, path: str, content: bytes) -> str:

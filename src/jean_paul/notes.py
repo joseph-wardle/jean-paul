@@ -67,10 +67,26 @@ class NoteDelivery:
         )
 
 
+NOTE_LINES = (
+    "A note has arrived for you{about}, from {author}.",
+    "Pardon the interruption. {author} has left you a note{about}.",
+    "Correspondence for you from {author}{about}. It came by the afternoon post.",
+    "A letter for you{about}, courtesy of {author}. I'd not leave it unopened long.",
+    "{author} has sent word{about}. I took the liberty of bringing it straight to you.",
+    ""
+)
+PUBLISH_NOTE_LINES = (
+    "Word of a new publish: {subject}, by {author}. A note has been left for you.",
+    "{author} has put out {subject}. They've left a note addressed to you.",
+)
+
+
 def message(note: shotgrid.Note) -> str:
     link = f"[Open it in ShotGrid](<{note.url}>)"
-    author = escape_markdown(note.author)
-    if note.is_publish:
-        return f"{escape_markdown(note.subject)} by {author}. There's a note for you. {link}"
-    about = f" on {escape_markdown(note.about)}" if note.about else ""
-    return f"You have a new note{about} from {author}. {link}"
+    words = {
+        "author": escape_markdown(note.author),
+        "subject": escape_markdown(note.subject),
+        "about": f" on {escape_markdown(note.about)}" if note.about else "",
+    }
+    lines = PUBLISH_NOTE_LINES if note.is_publish else NOTE_LINES
+    return f"{lines[note.id % len(lines)].format(**words)} {link}"
