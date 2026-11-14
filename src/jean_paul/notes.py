@@ -73,7 +73,6 @@ NOTE_LINES = (
     "Correspondence for you from {author}{about}. It came by the afternoon post.",
     "A letter for you{about}, courtesy of {author}. I'd not leave it unopened long.",
     "{author} has sent word{about}. I took the liberty of bringing it straight to you.",
-    ""
 )
 PUBLISH_NOTE_LINES = (
     "Word of a new publish: {subject}, by {author}. A note has been left for you.",
