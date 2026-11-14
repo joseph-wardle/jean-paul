@@ -1,13 +1,14 @@
 [project]
 name = "jean-paul"
 version = "0.1.0"
-description = "Files Discord forum posts as GitHub issues for the sandwich-pipeline."
+description = "Files Discord forum posts as GitHub issues, and DMs artists about their ShotGrid notes."
 readme = "README.md"
 authors = [{ name = "Joseph Wardle" }]
 requires-python = ">=3.12"
 dependencies = [
     "discord-py>=2.7.1,<3",
     "pygithub>=2.10.0,<3",
+    "shotgun-api3>=3.10.3,<4",
 ]
 
 [project.scripts]
